@@ -605,7 +605,81 @@
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+
+<!-- Firebase SDK (compat version for this existing single-file HTML project) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script>
+/* ============================================================
+   FIREBASE CONFIGURATION + SHARED MENU
+   ============================================================ */
+const firebaseConfig = {
+  apiKey: "AIzaSyA3XxSJ4IyElx59i0kHFI-quGN8bqBLjls",
+  authDomain: "canteen-preorder-cc808.firebaseapp.com",
+  projectId: "canteen-preorder-cc808",
+  storageBucket: "canteen-preorder-cc808.firebasestorage.app",
+  messagingSenderId: "199924053081",
+  appId: "1:199924053081:web:0a2630e39f0e0618e12d48",
+  measurementId: "G-X9789ST4DH"
+};
+
+const FIREBASE_ADMIN_UID = "z6a3FT6C6SMEze38HWJ3OdRuc7c2";
+firebase.initializeApp(firebaseConfig);
+const firebaseAuth = firebase.auth();
+const firestore = firebase.firestore();
+const sharedMenuCollection = firestore.collection("menu");
+let sharedMenuUnsubscribe = null;
+let sharedMenuReady = false;
+
+function startSharedMenuListener(){
+  if(sharedMenuUnsubscribe) return;
+  sharedMenuUnsubscribe = sharedMenuCollection.onSnapshot(snapshot => {
+    if(snapshot.empty){
+      sharedMenuReady = true;
+      return;
+    }
+
+    const onlineItems = snapshot.docs.map(doc => doc.data());
+    onlineItems.sort((a, b) => Number(a.id) - Number(b.id));
+
+    const localData = getData();
+    localData.menuItems = onlineItems;
+    localData.nextMenuItemId = Math.max(
+      12,
+      ...onlineItems.map(item => Number(item.id) || 0).map(id => id + 1)
+    );
+    saveData(localData);
+    sharedMenuReady = true;
+
+    if(currentPage === "home") loadHome();
+    if(currentPage === "admin") loadAdminDashboard();
+    if(currentPage === "student") loadStudentDashboard();
+  }, error => {
+    console.error("Shared menu listener error:", error);
+    flash("Unable to load the shared menu. Please check your internet connection.", "error");
+  });
+}
+
+async function publishLocalMenuIfEmpty(){
+  const snapshot = await sharedMenuCollection.limit(1).get();
+  if(!snapshot.empty) return;
+
+  const items = getData().menuItems;
+  const batch = firestore.batch();
+  items.forEach(item => {
+    batch.set(sharedMenuCollection.doc(String(item.id)), item);
+  });
+  await batch.commit();
+}
+
+async function saveSharedMenuItem(item){
+  if(!firebaseAuth.currentUser || firebaseAuth.currentUser.uid !== FIREBASE_ADMIN_UID){
+    throw new Error("Please sign in with the authorized Firebase admin account.");
+  }
+  await sharedMenuCollection.doc(String(item.id)).set(item);
+}
+
 /* ============================================================
    FOOD IMAGES + EMOJI MAP
    ============================================================ */
@@ -805,23 +879,40 @@ function login(e){
 }
 function logout(){
   stopScanner();
-  clearSession(); flash('Logged out.','success'); showPage('home');
+  clearSession();
+  if(firebaseAuth.currentUser) firebaseAuth.signOut().catch(error => console.error("Firebase sign-out error:", error));
+  flash('Logged out.','success');
+  showPage('home');
 }
 
 /* ============================================================
    SECRET ADMIN LOGIN
    ============================================================ */
-function openAdminLogin(){
-  const email = prompt('Staff Email:');
+async function openAdminLogin(){
+  const email = prompt('Firebase Admin Email:');
   if(email === null) return;
-  const password = prompt('Staff Password:');
+  const password = prompt('Firebase Admin Password:');
   if(password === null) return;
-  const data = getData();
-  const user = data.users.find(u => u.email === email && u.password === password && u.role === 'admin');
-  if(!user){ flash('Access denied.','error'); return; }
-  setSession({ id:user.id, role:user.role, name:user.name });
-  flash('Staff access granted. Welcome, Admin!','success');
-  showPage('admin');
+
+  try{
+    const credential = await firebaseAuth.signInWithEmailAndPassword(email.trim(), password);
+    if(credential.user.uid !== FIREBASE_ADMIN_UID){
+      await firebaseAuth.signOut();
+      flash('Access denied. This account is not an authorized admin.', 'error');
+      return;
+    }
+
+    const localAdmin = getData().users.find(u => u.role === 'admin') || {
+      id: 1, name: 'Admin', email: email.trim(), role: 'admin', walletBalance: 0
+    };
+    setSession({ id: localAdmin.id, role: 'admin', name: localAdmin.name });
+    await publishLocalMenuIfEmpty();
+    flash('Staff access granted. Shared menu connected.', 'success');
+    showPage('admin');
+  }catch(error){
+    console.error("Firebase admin login error:", error);
+    flash('Admin sign-in failed. Check your Firebase email and password.', 'error');
+  }
 }
 document.addEventListener('keydown', e => {
   if(e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'a'){
@@ -1107,27 +1198,56 @@ function updateOrderStatus(id, status){
   const o = data.orders.find(o => o.id === id);
   if(o){ o.status = status; saveData(data); flash(`Order ${id} updated to "${status}".`,'success'); loadAdminDashboard(); }
 }
-function toggleMenuItem(id){
+async function toggleMenuItem(id){
   const data = getData();
-  const i = data.menuItems.find(m => m.id === id);
-  if(i){ i.available = !i.available; saveData(data); flash(`"${i.name}" ${i.available ? 'enabled' : 'disabled'}.`); loadAdminDashboard(); }
+  const item = data.menuItems.find(m => m.id === id);
+  if(!item) return;
+
+  item.available = !item.available;
+  saveData(data);
+  try{
+    await saveSharedMenuItem(item);
+    flash(`"${item.name}" ${item.available ? 'enabled' : 'disabled'} for all devices.`, 'success');
+    loadAdminDashboard();
+  }catch(error){
+    item.available = !item.available;
+    saveData(data);
+    console.error("Menu update error:", error);
+    flash('Menu update could not be saved online. Please sign in as Firebase admin and try again.', 'error');
+    loadAdminDashboard();
+  }
 }
-function addMenuItem(e){
+
+async function addMenuItem(e){
   e.preventDefault();
   const name = document.getElementById('itemName').value.trim();
   const desc = document.getElementById('itemDesc').value.trim();
   const price = parseFloat(document.getElementById('itemPrice').value);
   const stock = parseInt(document.getElementById('itemStock').value);
   const img = document.getElementById('itemEmoji').value.trim();
-  if(!name || !desc || !price || !stock) return flash('All fields required.','error');
+  if(!name || !desc || !Number.isFinite(price) || price <= 0 || !Number.isFinite(stock) || stock <= 0){
+    return flash('Enter a name, description, valid price and valid stock.', 'error');
+  }
+
   const data = getData();
-  data.menuItems.push({
-    id:data.nextMenuItemId++, name, description:desc, price, stock,
-    available:true, img:img || FOOD_IMAGES[name] || '🍽️'
-  });
-  saveData(data); flash('Item added successfully.','success');
-  ['itemName','itemDesc','itemPrice','itemStock','itemEmoji'].forEach(id => document.getElementById(id).value = '');
-  loadAdminDashboard();
+  const item = {
+    id: data.nextMenuItemId++, name, description: desc, price, stock,
+    available: true, img: img || FOOD_IMAGES[name] || '🍽️'
+  };
+
+  try{
+    await saveSharedMenuItem(item);
+    data.menuItems.push(item);
+    saveData(data);
+    flash('Item added to the shared menu successfully.', 'success');
+    ['itemName','itemDesc','itemPrice','itemStock','itemEmoji'].forEach(id => {
+      document.getElementById(id).value = '';
+    });
+    loadAdminDashboard();
+  }catch(error){
+    console.error("Add menu item error:", error);
+    flash('Could not add the item online. Check Firebase admin sign-in and Firestore rules.', 'error');
+  }
 }
 
 /* ============================================================
@@ -1306,6 +1426,7 @@ function verifyQR(e){
    INIT
    ============================================================ */
 (function init(){
+  startSharedMenuListener();
   const data = getData();
   const defaults = defaultData();
   const existingNames = data.menuItems.map(i => i.name);
