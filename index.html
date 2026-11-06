@@ -929,6 +929,149 @@ function loadHome(){
 /* ============================================================
    AUTH
    ============================================================ */
+   
+async function login(e) {
+  e.preventDefault();
+
+  const email = document.getElementById('loginEmail').value.trim().toLowerCase();
+  const password = document.getElementById('loginPassword').value;
+  const button = e.submitter;
+
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Logging in...';
+  }
+
+  try {
+    // Step 1: Authenticate with Firebase
+    const credential = await firebaseAuth.signInWithEmailAndPassword(
+      email,
+      password
+    );
+
+    const firebaseUser = credential.user;
+    const uid = firebaseUser.uid;
+
+    // Step 2: Check whether this is the authorized admin
+    if (uid === FIREBASE_ADMIN_UID) {
+      const localAdmin = getData().users.find(u => u.role === 'admin') || {
+        id: 1,
+        name: 'Admin',
+        email: email,
+        role: 'admin',
+        walletBalance: 0
+      };
+
+      setSession({
+        id: localAdmin.id,
+        name: localAdmin.name,
+        email: email,
+        role: 'admin'
+      });
+
+      startSharedAccountListeners();
+
+      await publishLocalMenuIfEmpty();
+
+      document.getElementById('loginEmail').value = '';
+      document.getElementById('loginPassword').value = '';
+
+      flash('Admin login successful!', 'success');
+      showPage('admin');
+      return;
+    }
+
+    // Step 3: Get the student's Firestore profile
+    const userRef = usersCollection.doc(uid);
+    const userSnap = await userRef.get();
+
+    let profile;
+
+    if (userSnap.exists) {
+      profile = userSnap.data();
+    } else {
+      // Recover accounts that exist in Authentication
+      // but do not yet have a Firestore profile.
+      profile = {
+        uid: uid,
+        id: uid,
+        name: firebaseUser.displayName || email.split('@')[0],
+        email: email,
+        role: 'student',
+        walletBalance: 0,
+        createdAt: new Date().toISOString()
+      };
+
+      await userRef.set(profile);
+    }
+
+    // Step 4: Save student information locally
+    profile.uid = uid;
+    profile.id = uid;
+    profile.email = email;
+    profile.role = 'student';
+    profile.walletBalance = Number(profile.walletBalance || 0);
+
+    const data = getData();
+
+    data.users = data.users.filter(
+      u => u.uid !== uid && u.id !== uid
+    );
+
+    data.users.push(profile);
+    saveData(data);
+
+    // Step 5: Create the student session
+    setSession({
+      id: uid,
+      uid: uid,
+      name: profile.name,
+      email: email,
+      role: 'student'
+    });
+
+    // Step 6: Start Firebase listeners
+    startSharedAccountListeners();
+
+    // Record login activity without blocking login
+    try {
+      await recordStudentLogin(profile);
+    } catch (activityError) {
+      console.error('Login activity error:', activityError);
+    }
+
+    // Step 7: Open student dashboard
+    document.getElementById('loginEmail').value = '';
+    document.getElementById('loginPassword').value = '';
+
+    flash('Welcome back, ' + profile.name + '!', 'success');
+    showPage('student');
+
+  } catch (error) {
+    console.error('LOGIN ERROR:', error);
+
+    const messages = {
+      'auth/user-not-found': 'Account not found. Please register first.',
+      'auth/wrong-password': 'Incorrect password. Please try again.',
+      'auth/invalid-credential': 'Incorrect email or password.',
+      'auth/invalid-email': 'Please enter a valid email address.',
+      'auth/too-many-requests': 'Too many attempts. Please try again later.',
+      'permission-denied': 'Firestore permission denied. Please check your Firebase rules.'
+    };
+
+    flash(
+      messages[error.code] || 'Login failed: ' + error.message,
+      'error'
+    );
+
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.innerHTML = '<i class="bi bi-box-arrow-in-right me-2"></i>Login';
+    }
+  }
+}
+
 
 async function register(e) {
   e.preventDefault();
