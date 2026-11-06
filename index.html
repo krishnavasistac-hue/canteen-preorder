@@ -555,6 +555,8 @@
 
     <div class="section-head mt-5"><i class="bi bi-people"></i><h4 class="mb-0">Students</h4></div>
     <div class="card-soft p-3 p-lg-4" id="adminStudents"></div>
+    <div class="section-head mt-5"><i class="bi bi-clock-history"></i><h4 class="mb-0">Student Login Activity</h4></div>
+    <div class="card-soft p-3 p-lg-4" id="adminLoginActivity"><p class="text-secondary mb-0">Loading login activity...</p></div>
   </div>
 
   <!-- VERIFY (manual) -->
@@ -629,7 +631,15 @@ firebase.initializeApp(firebaseConfig);
 const firebaseAuth = firebase.auth();
 const firestore = firebase.firestore();
 const sharedMenuCollection = firestore.collection("menu");
+const usersCollection = firestore.collection("users");
+const ordersCollection = firestore.collection("orders");
+const activityCollection = firestore.collection("loginActivity");
+const walletTransactionsCollection = firestore.collection("walletTransactions");
 let sharedMenuUnsubscribe = null;
+let sharedUsersUnsubscribe = null;
+let sharedOrdersUnsubscribe = null;
+let sharedActivityUnsubscribe = null;
+let sharedWalletTransactionsUnsubscribe = null;
 let sharedMenuReady = false;
 
 function startSharedMenuListener(){
@@ -678,6 +688,73 @@ async function saveSharedMenuItem(item){
     throw new Error("Please sign in with the authorized Firebase admin account.");
   }
   await sharedMenuCollection.doc(String(item.id)).set(item);
+}
+
+function startSharedAccountListeners(){
+  if(!firebaseAuth.currentUser) return;
+  const uid = firebaseAuth.currentUser.uid;
+  const isAdmin = uid === FIREBASE_ADMIN_UID;
+  if(sharedUsersUnsubscribe) sharedUsersUnsubscribe();
+  if(sharedOrdersUnsubscribe) sharedOrdersUnsubscribe();
+  if(sharedActivityUnsubscribe) { sharedActivityUnsubscribe(); sharedActivityUnsubscribe = null; }
+  if(sharedWalletTransactionsUnsubscribe) { sharedWalletTransactionsUnsubscribe(); sharedWalletTransactionsUnsubscribe = null; }
+
+  const usersQuery = isAdmin ? usersCollection : usersCollection.where('uid','==',uid);
+  sharedUsersUnsubscribe = usersQuery.onSnapshot(snapshot => {
+    const data = getData();
+    const remoteUsers = snapshot.docs.map(doc => doc.data());
+    if(isAdmin){
+      data.users = [data.users.find(u => u.role === 'admin') || {id:1,name:'Admin',email:firebaseAuth.currentUser.email,role:'admin',walletBalance:0}, ...remoteUsers];
+    } else {
+      const profile = remoteUsers[0];
+      if(profile){
+        const old = data.users.find(u => u.uid === uid);
+        const merged = {...old,...profile, id:uid, role:'student'};
+        data.users = data.users.filter(u => u.uid !== uid && u.id !== uid);
+        data.users.push(merged);
+      }
+    }
+    saveData(data);
+    if(currentPage === 'admin') loadAdminDashboard();
+    if(currentPage === 'student') loadStudentDashboard();
+  }, error => console.error('Users sync error:', error));
+
+  const walletQuery = isAdmin ? walletTransactionsCollection.orderBy('createdAt','desc').limit(200) : walletTransactionsCollection.where('userId','==',uid);
+  sharedWalletTransactionsUnsubscribe = walletQuery.onSnapshot(snapshot => {
+    const data = getData();
+    const remoteTxns = snapshot.docs.map(doc => doc.data());
+    if(isAdmin) data.transactions = remoteTxns;
+    else data.transactions = data.transactions.filter(t => t.userId !== uid).concat(remoteTxns);
+    saveData(data);
+    if(currentPage === 'wallet') loadWallet();
+  }, error => console.error('Wallet transactions sync error:', error));
+
+  const ordersQuery = isAdmin ? ordersCollection : ordersCollection.where('userId','==',uid);
+  sharedOrdersUnsubscribe = ordersQuery.onSnapshot(snapshot => {
+    const data = getData();
+    const remoteOrders = snapshot.docs.map(doc => doc.data());
+    if(isAdmin) data.orders = remoteOrders;
+    else {
+      data.orders = data.orders.filter(o => o.userId !== uid).concat(remoteOrders);
+    }
+    saveData(data);
+    if(currentPage === 'admin') loadAdminDashboard();
+    if(currentPage === 'student') loadStudentDashboard();
+    if(currentPage === 'orders') loadOrders();
+  }, error => console.error('Orders sync error:', error));
+
+  if(isAdmin){
+    sharedActivityUnsubscribe = activityCollection.orderBy('createdAt','desc').limit(50).onSnapshot(snapshot => {
+      const target = document.getElementById('adminLoginActivity');
+      if(!target) return;
+      const rows = snapshot.docs.map(doc => doc.data());
+      target.innerHTML = rows.length ? `<div class="table-responsive"><table class="table table-hover align-middle mb-0"><thead><tr><th>Student</th><th>Email</th><th>Login time</th></tr></thead><tbody>${rows.map(a => `<tr><td>${escapeHtml(a.name || 'Student')}</td><td>${escapeHtml(a.email || '')}</td><td>${a.createdAt ? new Date(a.createdAt).toLocaleString() : ''}</td></tr>`).join('')}</tbody></table></div>` : '<p class="text-secondary mb-0">No login activity yet.</p>';
+    }, error => console.error('Login activity sync error:', error));
+  }
+}
+
+async function recordStudentLogin(profile){
+  await activityCollection.add({uid:profile.uid, name:profile.name, email:profile.email, createdAt:new Date().toISOString()});
 }
 
 /* ============================================================
@@ -772,7 +849,7 @@ function clearSession(){ sessionStorage.removeItem('canteenSession'); }
 function getCurrentUser(){
   const s = getSession(); if(!s) return null;
   const data = getData();
-  return data.users.find(u => u.id === s.id) || null;
+  return data.users.find(u => u.id === s.id || u.uid === s.id) || null;
 }
 
 /* ============================================================
@@ -852,34 +929,59 @@ function loadHome(){
 /* ============================================================
    AUTH
    ============================================================ */
-function register(e){
+async function register(e){
   e.preventDefault();
   const name = document.getElementById('regName').value.trim();
   const email = document.getElementById('regEmail').value.trim();
   const password = document.getElementById('regPassword').value;
   if(!name || !email || !password) return flash('All fields required.','error');
-  const data = getData();
-  if(data.users.find(u => u.email === email)) return flash('Email already registered.','error');
-  const user = { id:data.nextUserId++, name, email, password, role:'student', walletBalance:0 };
-  data.users.push(user); saveData(data);
-  flash('Registration success! Please login.','success');
-  showPage('login');
+  try{
+    const credential = await firebaseAuth.createUserWithEmailAndPassword(email, password);
+    const profile = {uid:credential.user.uid, id:credential.user.uid, name, email, role:'student', walletBalance:0, createdAt:new Date().toISOString()};
+    await usersCollection.doc(credential.user.uid).set(profile);
+    const data = getData();
+    data.users = data.users.filter(u => u.email !== email);
+    data.users.push(profile); saveData(data);
+    await firebaseAuth.signOut();
+    flash('Registration successful! Please login.','success');
+    showPage('login');
+  }catch(error){
+    console.error('Registration error:', error);
+    flash(error.code === 'auth/email-already-in-use' ? 'This email is already registered.' : 'Registration failed. Check your details and try again.','error');
+  }
 }
-function login(e){
+async function login(e){
   e.preventDefault();
   const email = document.getElementById('loginEmail').value.trim();
   const password = document.getElementById('loginPassword').value;
-  const data = getData();
-  const user = data.users.find(u => u.email === email && u.password === password);
-  if(!user) return flash('Invalid email or password.','error');
-  if(user.role === 'admin') return flash('Please use staff access to login as admin.','error');
-  setSession({ id:user.id, role:user.role, name:user.name });
-  flash(`Welcome back, ${user.name}!`,'success');
-  showPage('student');
+  try{
+    const credential = await firebaseAuth.signInWithEmailAndPassword(email, password);
+    if(credential.user.uid === FIREBASE_ADMIN_UID){
+      await firebaseAuth.signOut();
+      return flash('Please use staff access to login as admin.','error');
+    }
+    const profileRef = usersCollection.doc(credential.user.uid);
+    const profileSnap = await profileRef.get();
+    if(!profileSnap.exists){ await firebaseAuth.signOut(); return flash('Student profile not found. Please register again.','error'); }
+    const profile = {...profileSnap.data(), id:credential.user.uid, role:'student'};
+    const data = getData();
+    data.users = data.users.filter(u => u.uid !== profile.uid && u.id !== profile.uid);
+    data.users.push(profile); saveData(data);
+    setSession({id:profile.uid, uid:profile.uid, role:'student', name:profile.name});
+    await recordStudentLogin(profile);
+    startSharedAccountListeners();
+    flash(`Welcome back, ${profile.name}!`,'success');
+    showPage('student');
+  }catch(error){
+    console.error('Student login error:', error);
+    flash('Invalid email or password. If this is an older account, please register again.','error');
+  }
 }
 function logout(){
   stopScanner();
   clearSession();
+  [sharedUsersUnsubscribe,sharedOrdersUnsubscribe,sharedActivityUnsubscribe,sharedWalletTransactionsUnsubscribe].forEach(unsub=>{if(unsub)unsub();});
+  sharedUsersUnsubscribe=sharedOrdersUnsubscribe=sharedActivityUnsubscribe=sharedWalletTransactionsUnsubscribe=null;
   if(firebaseAuth.currentUser) firebaseAuth.signOut().catch(error => console.error("Firebase sign-out error:", error));
   flash('Logged out.','success');
   showPage('home');
@@ -907,7 +1009,8 @@ async function openAdminLogin(){
     };
     setSession({ id: localAdmin.id, role: 'admin', name: localAdmin.name });
     await publishLocalMenuIfEmpty();
-    flash('Staff access granted. Shared menu connected.', 'success');
+    startSharedAccountListeners();
+    flash('Staff access granted. Shared menu, students and orders connected.', 'success');
     showPage('admin');
   }catch(error){
     console.error("Firebase admin login error:", error);
@@ -955,7 +1058,7 @@ function loadStudentDashboard(){
 function loadRecentOrders(){
   const user = getCurrentUser(); if(!user) return;
   const data = getData();
-  const orders = data.orders.filter(o => o.userId === user.id).slice(-5).reverse();
+  const orders = data.orders.filter(o => o.userId === (user.uid || user.id)).slice(-5).reverse();
   const c = document.getElementById('recentOrders');
   if(!orders.length){ c.innerHTML = '<p class="text-secondary">No orders yet.</p>'; return; }
   c.innerHTML = `<div class="table-responsive card-soft p-3"><table class="table table-hover align-middle mb-0"><thead><tr><th>Order ID</th><th>Amount</th><th>Pickup</th><th>Status</th></tr></thead><tbody>${orders.map(o => `
@@ -968,7 +1071,7 @@ function statusColor(s){
   if(s === 'Preparing' || s === 'Order Confirmed') return 'info';
   return 'warning';
 }
-function placeOrder(e){
+async function placeOrder(e){
   e.preventDefault();
   const user = getCurrentUser(); if(!user) return flash('Please login.','error');
   const data = getData();
@@ -984,12 +1087,14 @@ function placeOrder(e){
     }
   });
   if(!selected.length) return flash('Select at least one item.','error');
-  if(user.walletBalance < total) return flash('Insufficient balance. Please add money via UPI.','error');
+  if(!firebaseAuth.currentUser || firebaseAuth.currentUser.uid !== (user.uid || user.id)) return flash('Please log in again to use your wallet.','error');
 
   const order = {
     id: generateOrderId(),
     numericId: data.nextOrderId++,
-    userId: user.id,
+    userId: user.uid || user.id,
+    studentName: user.name,
+    studentEmail: user.email,
     items: selected.map(i => ({ name:i.name, quantity:i.quantity, price:i.price })),
     totalAmount: total,
     pickupTime: pickup,
@@ -997,10 +1102,27 @@ function placeOrder(e){
     qrToken: generateQrToken(),
     createdAt: new Date().toISOString()
   };
+  try{
+    const userRef = usersCollection.doc(user.uid || user.id);
+    const orderRef = ordersCollection.doc(order.id);
+    const txnRef = walletTransactionsCollection.doc(`debit_${order.id}`);
+    await firestore.runTransaction(async transaction => {
+      const userSnap = await transaction.get(userRef);
+      if(!userSnap.exists) throw new Error('Student wallet was not found.');
+      const latestBalance = Number(userSnap.data().walletBalance || 0);
+      if(latestBalance < total) throw new Error('INSUFFICIENT_BALANCE');
+      transaction.update(userRef, {walletBalance: latestBalance - total, walletUpdatedAt:new Date().toISOString()});
+      transaction.set(orderRef, order);
+      transaction.set(txnRef, {id:txnRef.id,userId:user.uid || user.id,amount:total,type:'DEBIT',description:`Order ${order.id}`,createdAt:new Date().toISOString()});
+    });
+  }catch(error){
+    console.error('Order/wallet transaction error:',error);
+    return flash(error.message === 'INSUFFICIENT_BALANCE' ? 'Insufficient wallet balance. Please add money first.' : 'Order could not be placed. Please try again.','error');
+  }
   data.orders.push(order);
   selected.forEach(item => { const mi = data.menuItems.find(m => m.id === item.id); if(mi) mi.stock -= item.quantity; });
-  const uRec = data.users.find(u => u.id === user.id); if(uRec) uRec.walletBalance -= total;
-  data.transactions.push({ id:data.nextTransactionId++, userId:user.id, amount:total, type:'DEBIT', description:`Order ${order.id}`, createdAt:new Date().toISOString() });
+  const uRec = data.users.find(u => u.id === user.id || u.uid === user.id); if(uRec) uRec.walletBalance = Number(uRec.walletBalance || 0) - total;
+  data.transactions.push({ id:`debit_${order.id}`, userId:user.uid || user.id, amount:total, type:'DEBIT', description:`Order ${order.id}`, createdAt:new Date().toISOString() });
   saveData(data);
   flash(`Order placed successfully! 🎉 Your Order ID: <b>${order.id}</b>`,'success');
   loadStudentDashboard();
@@ -1015,7 +1137,7 @@ function loadWallet(){
   renderUpiQr();
   syncUpiAmount();
   const data = getData();
-  const txns = data.transactions.filter(t => t.userId === user.id).reverse();
+  const txns = data.transactions.filter(t => t.userId === (user.uid || user.id)).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
   const c = document.getElementById('transactionHistory');
   if(!txns.length){ c.innerHTML = '<p class="text-secondary mb-0">No transactions.</p>'; return; }
   c.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0"><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Description</th></tr></thead><tbody>${txns.map(t => `
@@ -1045,21 +1167,34 @@ function addMoney(e){
   if(!amt || amt <= 0) return flash('Enter a valid amount.','error');
   flash('Scan the QR with any UPI app, then click "Simulate Successful Payment".','info');
 }
-function simulateUPIPayment(){
+async function simulateUPIPayment(){
   const user = getCurrentUser(); if(!user) return flash('Please login first.','error');
+  if(!firebaseAuth.currentUser || firebaseAuth.currentUser.uid !== (user.uid || user.id)) return flash('Please log in again before adding wallet credit.','error');
   const input = document.getElementById('addAmount');
-  const amt = parseFloat(input.value);
-  if(!amt || amt <= 0) return flash('Enter amount first.','error');
-  const data = getData();
-  const uRec = data.users.find(u => u.id === user.id);
-  if(uRec){
-    uRec.walletBalance += amt;
-    data.transactions.push({ id:data.nextTransactionId++, userId:user.id, amount:amt, type:'CREDIT', description:'UPI payment', createdAt:new Date().toISOString() });
+  const amt = Number(input.value);
+  if(!Number.isFinite(amt) || amt <= 0 || amt > 10000) return flash('Enter an amount between ₹1 and ₹10,000.','error');
+  const uid = user.uid || user.id;
+  const txnId = `credit_${uid}_${Date.now()}`;
+  const userRef = usersCollection.doc(uid);
+  const txnRef = walletTransactionsCollection.doc(txnId);
+  try{
+    await firestore.runTransaction(async transaction => {
+      const userSnap = await transaction.get(userRef);
+      if(!userSnap.exists) throw new Error('Student wallet was not found.');
+      const balance = Number(userSnap.data().walletBalance || 0);
+      transaction.update(userRef,{walletBalance:balance+amt,walletUpdatedAt:new Date().toISOString()});
+      transaction.set(txnRef,{id:txnId,userId:uid,amount:amt,type:'CREDIT',description:'Demo UPI top-up (simulated)',createdAt:new Date().toISOString()});
+    });
+    const data = getData();
+    const localUser = data.users.find(u => u.uid === uid || u.id === uid);
+    if(localUser) localUser.walletBalance = Number(localUser.walletBalance || 0) + amt;
+    data.transactions.push({id:txnId,userId:uid,amount:amt,type:'CREDIT',description:'Demo UPI top-up (simulated)',createdAt:new Date().toISOString()});
     saveData(data);
-    flash(`₹${amt.toFixed(2)} added to wallet via UPI! ✅`,'success');
-    loadWallet();
-    input.value = '';
-    syncUpiAmount();
+    flash(`Demo wallet credit of ₹${amt.toFixed(2)} synced successfully!`,'success');
+    input.value = ''; syncUpiAmount(); loadWallet();
+  }catch(error){
+    console.error('Wallet credit error:',error);
+    flash('Wallet update failed. Check your Firestore rules and internet connection.','error');
   }
 }
 
@@ -1069,7 +1204,7 @@ function simulateUPIPayment(){
 function loadOrders(){
   const user = getCurrentUser(); if(!user) return;
   const data = getData();
-  const orders = data.orders.filter(o => o.userId === user.id).reverse();
+  const orders = data.orders.filter(o => o.userId === (user.uid || user.id)).reverse();
   const c = document.getElementById('allOrders');
   if(!orders.length){
     c.innerHTML = `<div class="card-soft p-5 text-center"><i class="bi bi-inbox display-1 text-secondary opacity-50"></i><h4 class="mt-3">No orders yet</h4><a onclick="showPage('student')" class="btn btn-primary-soft mt-3">Order now</a></div>`;
@@ -1125,11 +1260,11 @@ function loadAdminDashboard(){
   else oc.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
     <thead><tr><th>Order ID</th><th>Student</th><th>Amount</th><th>Pickup</th><th>Status</th><th>Show QR</th><th>Update</th></tr></thead>
     <tbody>${orders.map(o => {
-      const user = data.users.find(u => u.id === o.userId);
+      const user = data.users.find(u => u.id === o.userId || u.uid === o.userId);
       const collected = o.status === 'Collected';
       return `<tr>
         <td><span class="order-id-code">${o.id}</span></td>
-        <td>${user ? escapeHtml(user.name) : 'Unknown'}</td>
+        <td>${user ? escapeHtml(user.name) : escapeHtml(o.studentName || 'Unknown')}<div class="small text-secondary">${escapeHtml(user ? user.email : (o.studentEmail || ''))}</div></td>
         <td>₹${o.totalAmount.toFixed(2)}</td>
         <td>${escapeHtml(o.pickupTime)}</td>
         <td><span class="status-badge bg-${statusColor(o.status)} text-dark">${o.status}</span></td>
@@ -1163,8 +1298,8 @@ function loadAdminDashboard(){
   const students = data.users.filter(u => u.role === 'student');
   if(!students.length) sc.innerHTML = '<p class="text-secondary mb-0">No students registered.</p>';
   else sc.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
-    <thead><tr><th>Name</th><th>Email</th><th>Balance</th></tr></thead>
-    <tbody>${students.map(s => `<tr><td class="fw-semibold">${escapeHtml(s.name)}</td><td>${escapeHtml(s.email)}</td><td>₹${s.walletBalance.toFixed(2)}</td></tr>`).join('')}</tbody>
+    <thead><tr><th>Name</th><th>Email</th><th>Registered</th></tr></thead>
+    <tbody>${students.map(s => `<tr><td class="fw-semibold">${escapeHtml(s.name)}</td><td>${escapeHtml(s.email)}</td><td>${s.createdAt ? new Date(s.createdAt).toLocaleDateString() : '—'}</td></tr>`).join('')}</tbody>
   </table></div>`;
 }
 
@@ -1172,7 +1307,7 @@ function showOrderQr(orderId){
   const data = getData();
   const order = data.orders.find(o => o.id === orderId);
   if(!order){ flash('Order not found.','error'); return; }
-  const student = data.users.find(u => u.id === order.userId);
+  const student = data.users.find(u => u.id === order.userId || u.uid === order.userId);
 
   document.getElementById('modalOrderInfo').innerHTML = `
     <div class="order-id-code d-inline-block">${order.id}</div>
@@ -1193,10 +1328,19 @@ function showOrderQr(orderId){
   modal.show();
 }
 
-function updateOrderStatus(id, status){
+async function updateOrderStatus(id, status){
   const data = getData();
   const o = data.orders.find(o => o.id === id);
-  if(o){ o.status = status; saveData(data); flash(`Order ${id} updated to "${status}".`,'success'); loadAdminDashboard(); }
+  if(!o) return;
+  try{
+    await ordersCollection.doc(id).update({status});
+    o.status = status; saveData(data);
+    flash(`Order ${id} updated to "${status}" on all devices.`, 'success');
+    loadAdminDashboard();
+  }catch(error){
+    console.error('Order status update error:', error);
+    flash('Could not update order status online. Please check your admin login and Firestore rules.', 'error');
+  }
 }
 async function toggleMenuItem(id){
   const data = getData();
@@ -1427,6 +1571,7 @@ function verifyQR(e){
    ============================================================ */
 (function init(){
   startSharedMenuListener();
+  firebaseAuth.onAuthStateChanged(user => { if(user) startSharedAccountListeners(); });
   const data = getData();
   const defaults = defaultData();
   const existingNames = data.menuItems.map(i => i.name);
