@@ -929,64 +929,102 @@ function loadHome(){
 /* ============================================================
    AUTH
    ============================================================ */
-async function register(e){
-  e.preventDefault();
-  const name = document.getElementById('regName').value.trim();
-  const email = document.getElementById('regEmail').value.trim();
-  const password = document.getElementById('regPassword').value;
-  if(!name || !email || !password) return flash('All fields required.','error');
-  try{
-    const credential = await firebaseAuth.createUserWithEmailAndPassword(email, password);
-    const profile = {uid:credential.user.uid, id:credential.user.uid, name, email, role:'student', walletBalance:0, createdAt:new Date().toISOString()};
-    await usersCollection.doc(credential.user.uid).set(profile);
-    const data = getData();
-    data.users = data.users.filter(u => u.email !== email);
-    data.users.push(profile); saveData(data);
-    await firebaseAuth.signOut();
-    flash('Registration successful! Please login.','success');
-    showPage('login');
-  }catch(error){
-    console.error('Registration error:', error);
-    flash(error.code === 'auth/email-already-in-use' ? 'This email is already registered.' : 'Registration failed. Check your details and try again.','error');
-  }
-}
-async function login(e){
-  e.preventDefault();
-  const email = document.getElementById('loginEmail').value.trim();
-  const password = document.getElementById('loginPassword').value;
-  try{
-    const credential = await firebaseAuth.signInWithEmailAndPassword(email, password);
-    if(credential.user.uid === FIREBASE_ADMIN_UID){
-      await firebaseAuth.signOut();
-      return flash('Please use staff access to login as admin.','error');
-    }
-    const profileRef = usersCollection.doc(credential.user.uid);
-    const profileSnap = await profileRef.get();
-    if(!profileSnap.exists){ await firebaseAuth.signOut(); return flash('Student profile not found. Please register again.','error'); }
-    const profile = {...profileSnap.data(), id:credential.user.uid, role:'student'};
-    const data = getData();
-    data.users = data.users.filter(u => u.uid !== profile.uid && u.id !== profile.uid);
-    data.users.push(profile); saveData(data);
-    setSession({id:profile.uid, uid:profile.uid, role:'student', name:profile.name});
-    await recordStudentLogin(profile);
-    startSharedAccountListeners();
-    flash(`Welcome back, ${profile.name}!`,'success');
-    showPage('student');
-  }catch(error){
-    console.error('Student login error:', error);
-    flash('Invalid email or password. If this is an older account, please register again.','error');
-  }
-}
-function logout(){
-  stopScanner();
-  clearSession();
-  [sharedUsersUnsubscribe,sharedOrdersUnsubscribe,sharedActivityUnsubscribe,sharedWalletTransactionsUnsubscribe].forEach(unsub=>{if(unsub)unsub();});
-  sharedUsersUnsubscribe=sharedOrdersUnsubscribe=sharedActivityUnsubscribe=sharedWalletTransactionsUnsubscribe=null;
-  if(firebaseAuth.currentUser) firebaseAuth.signOut().catch(error => console.error("Firebase sign-out error:", error));
-  flash('Logged out.','success');
-  showPage('home');
-}
 
+async function register(e) {
+  e.preventDefault();
+
+  const name = document.getElementById('regName').value.trim();
+  const email = document.getElementById('regEmail').value.trim().toLowerCase();
+  const password = document.getElementById('regPassword').value;
+  const button = e.submitter;
+
+  if (!name || !email || !password) {
+    return flash('Please fill in all fields.', 'error');
+  }
+
+  if (password.length < 6) {
+    return flash('Password must contain at least 6 characters.', 'error');
+  }
+
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Registering...';
+  }
+
+  try {
+    // Step 1: Create Firebase Authentication account
+    const credential = await firebaseAuth.createUserWithEmailAndPassword(
+      email,
+      password
+    );
+
+    const uid = credential.user.uid;
+
+    // Step 2: Save student profile in Firestore
+    const profile = {
+      uid: uid,
+      id: uid,
+      name: name,
+      email: email,
+      role: 'student',
+      walletBalance: 0,
+      createdAt: new Date().toISOString()
+    };
+
+    await usersCollection.doc(uid).set(profile);
+
+    // Step 3: Update local student data
+    const data = getData();
+
+    data.users = data.users.filter(
+      u => u.uid !== uid && u.id !== uid && u.email !== email
+    );
+
+    data.users.push(profile);
+    saveData(data);
+
+    // Step 4: Sign out and redirect to login
+    await firebaseAuth.signOut();
+
+    document.getElementById('regName').value = '';
+    document.getElementById('regEmail').value = '';
+    document.getElementById('regPassword').value = '';
+
+    flash('Account created successfully! Please login.', 'success');
+    showPage('login');
+
+  } catch (error) {
+    console.error('FULL REGISTRATION ERROR:', error);
+
+    const messages = {
+      'auth/email-already-in-use':
+        'This email is already registered. Please login instead.',
+      'auth/invalid-email':
+        'Please enter a valid email address.',
+      'auth/weak-password':
+        'Password is too weak. Use at least 6 characters.',
+      'auth/operation-not-allowed':
+        'Email/password registration is disabled in Firebase.',
+      'auth/network-request-failed':
+        'Network error. Check your internet connection.',
+      'permission-denied':
+        'Firebase Firestore denied permission to save your profile.',
+      'auth/too-many-requests':
+        'Too many attempts. Please try again later.'
+    };
+
+    const message = messages[error.code] ||
+      `Registration failed: ${error.message || 'Unknown error'}`;
+
+    flash(message, 'error');
+
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.innerHTML = '<i class="bi bi-person-add me-2"></i>Register';
+    }
+  }
+}
 /* ============================================================
    SECRET ADMIN LOGIN
    ============================================================ */
