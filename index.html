@@ -1492,23 +1492,33 @@ function loadAdminDashboard(){
   const oc = document.getElementById('adminOrders');
   if(!orders.length) oc.innerHTML = '<p class="text-secondary mb-0">No orders yet.</p>';
   else oc.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
-    <thead><tr><th>Order ID</th><th>Student</th><th>Amount</th><th>Pickup</th><th>Status</th><th>Show QR</th><th>Update</th></tr></thead>
+    <thead><tr><th>Order ID</th><th>Student</th><th>Items &amp; Quantity</th><th>Amount</th><th>Pickup</th><th>Status</th><th>Show QR</th><th>Update</th></tr></thead>
     <tbody>${orders.map(o => {
       const user = data.users.find(u => u.id === o.userId || u.uid === o.userId);
       const collected = o.status === 'Collected';
+      const orderItems = Array.isArray(o.items) ? o.items : [];
+      const itemsHtml = orderItems.length
+        ? `<div class="d-flex flex-column gap-1">${orderItems.map(i => {
+            const itemName = escapeHtml(i.name || 'Unnamed item');
+            const qty = Math.max(0, Number(i.quantity) || 0);
+            const price = Number(i.price) || 0;
+            return `<div class="d-flex justify-content-between align-items-center gap-3 border rounded-3 px-2 py-1" style="min-width:190px;background:#f8faff"><span class="fw-semibold">${itemName}</span><span class="badge bg-primary rounded-pill">× ${qty}</span></div><div class="small text-secondary ps-2">₹${price.toFixed(2)} each · Subtotal ₹${(price * qty).toFixed(2)}</div>`;
+          }).join('')}</div>`
+        : '<span class="small text-danger">Item details unavailable</span>';
       return `<tr>
-        <td><span class="order-id-code">${o.id}</span></td>
+        <td><span class="order-id-code">${escapeHtml(o.id || '')}</span></td>
         <td>${user ? escapeHtml(user.name) : escapeHtml(o.studentName || 'Unknown')}<div class="small text-secondary">${escapeHtml(user ? user.email : (o.studentEmail || ''))}</div></td>
-        <td>₹${o.totalAmount.toFixed(2)}</td>
-        <td>${escapeHtml(o.pickupTime)}</td>
-        <td><span class="status-badge bg-${statusColor(o.status)} text-dark">${o.status}</span></td>
+        <td>${itemsHtml}</td>
+        <td>₹${(Number(o.totalAmount) || 0).toFixed(2)}</td>
+        <td>${escapeHtml(o.pickupTime || '')}</td>
+        <td><span class="status-badge bg-${statusColor(o.status)} text-dark">${escapeHtml(o.status || 'Order Placed')}</span></td>
         <td>
           <button class="btn btn-sm ${collected ? 'btn-outline-soft' : 'btn-primary-soft'} px-3"
-            onclick="showOrderQr('${o.id}')" ${collected ? 'disabled title="Already collected"' : ''}>
+            onclick="showOrderQr('${String(o.id || '').replace(/'/g, '&#39;')}')" ${collected ? 'disabled title="Already collected"' : ''}>
             <i class="bi bi-qr-code me-1"></i>${collected ? 'Collected' : 'Show QR'}
           </button>
         </td>
-        <td><select class="form-select form-select-sm admin-select" onchange="updateOrderStatus('${o.id}', this.value)">
+        <td><select class="form-select form-select-sm admin-select" onchange="updateOrderStatus('${String(o.id || '').replace(/'/g, '&#39;')}', this.value)">
           ${['Order Placed','Order Confirmed','Preparing','Ready for Pickup','Collected'].map(s => `<option value="${s}" ${o.status === s ? 'selected' : ''}>${s}</option>`).join('')}
         </select></td>
       </tr>`;
