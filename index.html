@@ -1079,87 +1079,140 @@ async function register(e) {
   const name = document.getElementById('regName').value.trim();
   const email = document.getElementById('regEmail').value.trim().toLowerCase();
   const password = document.getElementById('regPassword').value;
-  const button = e.submitter;
+  const form = e.currentTarget;
+  const button = e.submitter || form.querySelector('button[type="submit"], button:not([type])');
 
   if (!name || !email || !password) {
-    return flash('Please fill in all fields.', 'error');
+    flash('Please fill in all fields.', 'error');
+    return;
   }
 
   if (password.length < 6) {
-    return flash('Password must contain at least 6 characters.', 'error');
+    flash('Password must contain at least 6 characters.', 'error');
+    return;
   }
 
   if (button) {
     button.disabled = true;
-    button.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Registering...';
+    button.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Creating account...';
   }
 
+  let signedInUid = null;
+
   try {
-    // Step 1: Create Firebase Authentication account
-    const credential = await firebaseAuth.createUserWithEmailAndPassword(
-      email,
-      password
-    );
+    let firebaseUser;
+    let accountAlreadyExisted = false;
 
-    const uid = credential.user.uid;
+    // First try to create a new Firebase Authentication account.
+    try {
+      const credential = await firebaseAuth.createUserWithEmailAndPassword(email, password);
+      firebaseUser = credential.user;
+      signedInUid = firebaseUser.uid;
 
-    // Step 2: Save student profile in Firestore
+      // Keep the Firebase Auth display name in sync with the registration form.
+      if (firebaseUser.updateProfile) {
+        await firebaseUser.updateProfile({ displayName: name });
+      }
+    } catch (createError) {
+      // If Auth creation succeeded earlier but the Firestore profile save failed,
+      // a retry will return email-already-in-use. Sign in with the entered
+      // credentials and repair the missing profile instead of getting stuck.
+      if (createError.code !== 'auth/email-already-in-use') throw createError;
+
+      const credential = await firebaseAuth.signInWithEmailAndPassword(email, password);
+      firebaseUser = credential.user;
+      signedInUid = firebaseUser.uid;
+      accountAlreadyExisted = true;
+    }
+
+    const uid = firebaseUser.uid;
+
+    // Never allow a student registration attempt to modify the admin profile.
+    if (uid === FIREBASE_ADMIN_UID) {
+      throw Object.assign(new Error('This email belongs to the administrator account. Please use the staff login.'), {
+        code: 'registration/admin-account'
+      });
+    }
+
+    // Read first so an existing wallet balance and registration date are preserved.
+    const userRef = usersCollection.doc(uid);
+    const userSnap = await userRef.get();
+    const existingProfile = userSnap.exists ? userSnap.data() : {};
+
     const profile = {
+      ...existingProfile,
       uid: uid,
       id: uid,
-      name: name,
+      name: userSnap.exists && existingProfile.name ? existingProfile.name : name,
       email: email,
       role: 'student',
-      walletBalance: 0,
-      createdAt: new Date().toISOString()
+      walletBalance: Number(existingProfile.walletBalance || 0),
+      createdAt: existingProfile.createdAt || new Date().toISOString()
     };
 
-    await usersCollection.doc(uid).set(profile);
+    // Merge avoids wiping any additional profile fields used by the app.
+    await userRef.set(profile, { merge: true });
 
-    // Step 3: Update local student data
+    // Update the local cache so the admin/student UI can show the new profile.
     const data = getData();
-
     data.users = data.users.filter(
-      u => u.uid !== uid && u.id !== uid && u.email !== email
+      u => u.uid !== uid && u.id !== uid && String(u.email || '').toLowerCase() !== email
     );
-
     data.users.push(profile);
     saveData(data);
 
-    // Step 4: Sign out and redirect to login
+    // Registration ends on the login page; do not leave a new account signed in.
     await firebaseAuth.signOut();
+    signedInUid = null;
 
     document.getElementById('regName').value = '';
     document.getElementById('regEmail').value = '';
     document.getElementById('regPassword').value = '';
 
-    flash('Account created successfully! Please login.', 'success');
+    if (accountAlreadyExisted) {
+      flash('Your account already existed. We checked/repaired its student profile. Please login.', 'success');
+    } else {
+      flash('Account created successfully! Please login.', 'success');
+    }
     showPage('login');
 
   } catch (error) {
     console.error('FULL REGISTRATION ERROR:', error);
 
+    // If profile creation failed after Auth sign-in, sign out safely.
+    // The next attempt can recover using the email/password entered above.
+    if (signedInUid && firebaseAuth.currentUser && firebaseAuth.currentUser.uid === signedInUid) {
+      try { await firebaseAuth.signOut(); } catch (signOutError) {
+        console.warn('Could not sign out after registration error:', signOutError);
+      }
+    }
+
     const messages = {
       'auth/email-already-in-use':
-        'This email is already registered. Please login instead.',
+        'This email is already registered. Enter the same password to repair its profile, or go to Login.',
+      'auth/wrong-password':
+        'This email is already registered, but the password is incorrect. Please use Login or reset your password.',
+      'auth/invalid-credential':
+        'This email may already be registered. Check the password or go to Login.',
       'auth/invalid-email':
         'Please enter a valid email address.',
       'auth/weak-password':
         'Password is too weak. Use at least 6 characters.',
       'auth/operation-not-allowed':
-        'Email/password registration is disabled in Firebase.',
+        'Email/password registration is disabled in Firebase Authentication. Enable the Email/Password provider.',
+      'auth/unauthorized-domain':
+        'This website domain is not authorized in Firebase. Add your GitHub Pages domain under Firebase Authentication settings.',
       'auth/network-request-failed':
-        'Network error. Check your internet connection.',
+        'Network error. Check your internet connection and try again.',
       'permission-denied':
-        'Firebase Firestore denied permission to save your profile.',
+        'Firebase Firestore denied access to the student profile. Check your Firestore security rules.',
+      'registration/admin-account':
+        'This email belongs to the administrator account. Please use the staff login.',
       'auth/too-many-requests':
         'Too many attempts. Please try again later.'
     };
 
-    const message = messages[error.code] ||
-      `Registration failed: ${error.message || 'Unknown error'}`;
-
-    flash(message, 'error');
+    flash(messages[error.code] || `Registration failed: ${error.message || 'Unknown error'}`, 'error');
 
   } finally {
     if (button) {
