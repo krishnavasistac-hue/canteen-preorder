@@ -626,7 +626,13 @@ const firebaseConfig = {
   measurementId: "G-X9789ST4DH"
 };
 
-const FIREBASE_ADMIN_UID = "z6a3FT6C6SMEze38HWJ3OdRuc7c2";
+const FIREBASE_ADMIN_UIDS = [
+  "z6a3FT6C6SMEze38HWJ3OdRuc7c2",
+  "afRrBhEffbVPpMzo8ToELVg36P83"
+];
+function isAdminUid(uid) {
+  return FIREBASE_ADMIN_UIDS.includes(uid);
+}
 firebase.initializeApp(firebaseConfig);
 const firebaseAuth = firebase.auth();
 const firestore = firebase.firestore();
@@ -684,7 +690,7 @@ async function publishLocalMenuIfEmpty(){
 }
 
 async function saveSharedMenuItem(item){
-  if(!firebaseAuth.currentUser || firebaseAuth.currentUser.uid !== FIREBASE_ADMIN_UID){
+  if(!firebaseAuth.currentUser || !isAdminUid(firebaseAuth.currentUser.uid)){
     throw new Error("Please sign in with the authorized Firebase admin account.");
   }
   await sharedMenuCollection.doc(String(item.id)).set(item);
@@ -693,7 +699,7 @@ async function saveSharedMenuItem(item){
 function startSharedAccountListeners(){
   if(!firebaseAuth.currentUser) return;
   const uid = firebaseAuth.currentUser.uid;
-  const isAdmin = uid === FIREBASE_ADMIN_UID;
+  const isAdmin = isAdminUid(uid);
   if(sharedUsersUnsubscribe) sharedUsersUnsubscribe();
   if(sharedOrdersUnsubscribe) sharedOrdersUnsubscribe();
   if(sharedActivityUnsubscribe) { sharedActivityUnsubscribe(); sharedActivityUnsubscribe = null; }
@@ -953,7 +959,7 @@ async function login(e) {
     const uid = firebaseUser.uid;
 
     // Step 2: Check whether this is the authorized admin
-    if (uid === FIREBASE_ADMIN_UID) {
+    if (isAdminUid(uid)) {
       const localAdmin = getData().users.find(u => u.role === 'admin') || {
         id: 1,
         name: 'Admin',
@@ -1128,7 +1134,7 @@ async function register(e) {
     const uid = firebaseUser.uid;
 
     // Never allow a student registration attempt to modify the admin profile.
-    if (uid === FIREBASE_ADMIN_UID) {
+    if (isAdminUid(uid)) {
       throw Object.assign(new Error('This email belongs to the administrator account. Please use the staff login.'), {
         code: 'registration/admin-account'
       });
@@ -1232,7 +1238,7 @@ async function openAdminLogin(){
 
   try{
     const credential = await firebaseAuth.signInWithEmailAndPassword(email.trim(), password);
-    if(credential.user.uid !== FIREBASE_ADMIN_UID){
+    if(!isAdminUid(credential.user.uid)){
       await firebaseAuth.signOut();
       flash('Access denied. This account is not an authorized admin.', 'error');
       return;
